@@ -1,9 +1,20 @@
 import tkinter as tk
 from tkinter import messagebox, filedialog
+from tkinter import ttk
 import base64
 import xml.etree.ElementTree as ET
 import os
 import shutil
+import socket
+import ssl
+import concurrent.futures
+import threading
+import time
+# Optional: ftplib reserved for future auth checks
+# import ftplib
+
+# Feature flag: set to False to hide/disable connectivity checks entirely
+ENABLE_CONNECTIVITY_CHECK = True
 
 # Global to hold the selected XML path
 selected_xml_path = None
@@ -156,6 +167,8 @@ def choose_xml_file():
         xml_path_var.set(path)
         add_button.config(state=tk.NORMAL)
         reassign_button.config(state=tk.NORMAL)
+        if ENABLE_CONNECTIVITY_CHECK:
+            test_button.config(state=tk.NORMAL)
 
 
 def add_printer():
@@ -318,6 +331,115 @@ Backup saved as:
         messagebox.showerror("Error Writing XML", f"{e}")
 
 
+# -------- Connectivity Check (Reachability over implicit FTPS) --------
+
+def _tls_reachability(host: str, port: int = 990, timeout: float = 10.0) -> (bool, str):
+    """Attempt TCP connect and TLS handshake to confirm FTPS implicit availability.
+    Returns (ok, detail). Uses permissive SSL context (self-signed OK).
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                # If handshake succeeds, we're good
+                return True, "TLS handshake OK"
+    except Exception as e:
+        return False, str(e)
+
+
+def test_connectivity_reachability(xml_path: str, update_row_cb, done_cb, max_workers: int = 5):
+    """Run reachability tests in a thread pool and update UI via callbacks.
+    update_row_cb(name, host, ok, detail)
+    done_cb()
+    """
+    def _worker(entries):
+        for name, host in entries:
+            ok, detail = _tls_reachability(host)
+            update_row_cb(name, host, ok, detail)
+
+    # Parse XML and collect (Name, Host)
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        servers_el = get_servers_root(root)
+        pairs = []
+        for srv in servers_el.findall('Server'):
+            name = (srv.findtext('Name') or '').strip()
+            host = (srv.findtext('Host') or '').strip()
+            if not name or not host:
+                continue
+            pairs.append((name, host))
+        # Sort for deterministic order
+        pairs.sort(key=lambda p: (name_to_index(p[0]), p[0].lower()))
+    except Exception as e:
+        # Fallback: report error via first row
+        update_row_cb("<parse error>", "-", False, str(e))
+        done_cb()
+        return
+
+    # Chunk work and run in pool
+    chunks = [pairs[i::max_workers] for i in range(max_workers)] if pairs else []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(_worker, chunk) for chunk in chunks]
+        for _ in concurrent.futures.as_completed(futs):
+            pass
+    done_cb()
+
+
+def open_connectivity_window():
+    if not selected_xml_path:
+        messagebox.showerror("No XML Selected", "Please select the FileZilla XML file first.")
+        return
+
+    win = tk.Toplevel(root)
+    win.title("Connectivity Check — Reachability (Implicit FTPS)")
+    win.geometry("800x400")
+
+    cols = ("Name", "Host", "Result", "Detail")
+    treeview = ttk.Treeview(win, columns=cols, show="headings")
+    for c in cols:
+        treeview.heading(c, text=c)
+        treeview.column(c, width=180 if c != "Detail" else 360, anchor="w")
+    treeview.pack(fill="both", expand=True, padx=10, pady=10)
+
+    # Pre-populate rows
+    try:
+        tree = ET.parse(selected_xml_path)
+        root_el = tree.getroot()
+        servers_el = get_servers_root(root_el)
+        rows = []
+        for srv in servers_el.findall('Server'):
+            name = (srv.findtext('Name') or '').strip()
+            host = (srv.findtext('Host') or '').strip()
+            if not name or not host:
+                continue
+            iid = treeview.insert('', 'end', values=(name, host, 'Pending…', ''))
+            rows.append((iid, name, host))
+    except Exception as e:
+        messagebox.showerror("Parse Error", str(e))
+        win.destroy()
+        return
+
+    status_var = tk.StringVar(value="Running reachability tests…")
+    status = tk.Label(win, textvariable=status_var, anchor="w")
+    status.pack(fill="x", padx=10, pady=(0,10))
+
+    stop_flag = {"stop": False}
+
+    def update_row(name, host, ok, detail):
+        # Find iid by name+host (simple linear; small N)
+        for iid, n, h in rows:
+            if n == name and h == host:
+                treeview.item(iid, values=(n, h, "OK" if ok else "FAIL", detail))
+                break
+
+    def done():
+        status_var.set("Done.")
+
+    threading.Thread(target=test_connectivity_reachability, args=(selected_xml_path, update_row, done), daemon=True).start()
+
 # -------- GUI --------
 root = tk.Tk()
 root.title("Add Printer to FileZilla XML")
@@ -352,6 +474,14 @@ add_button = tk.Button(root, text="Add / Update Printer", command=add_printer, s
 add_button.grid(row=row + 4, column=0, pady=12, sticky="we")
 reassign_button = tk.Button(root, text="Reassign Colours Now", command=reassign_only, state=tk.DISABLED)
 reassign_button.grid(row=row + 4, column=1, pady=12, sticky="we")
+
+# Connectivity test button (flagged)
+if ENABLE_CONNECTIVITY_CHECK:
+    test_button = tk.Button(root, text="Test Connectivity", command=open_connectivity_window, state=tk.DISABLED)
+    test_button.grid(row=row + 5, column=0, columnspan=2, pady=(0,12), sticky="we")
+else:
+    test_button = tk.Button(root, text="Test Connectivity", state=tk.DISABLED)
+    test_button.grid(row=row + 5, column=0, columnspan=2, pady=(0,12), sticky="we")
 
 # Make column 1 grow
 root.grid_columnconfigure(1, weight=1)
