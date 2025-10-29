@@ -21,6 +21,16 @@ TENS = {
 }
 
 
+def reassign_colours(servers_el: ET.Element):
+    """Reassign Colour values across all <Server> blocks in strict 1..7 cycle after sorting."""
+    srvs = [s for s in list(servers_el) if s.tag == 'Server']
+    for idx, s in enumerate(srvs, start=1):
+        colour_el = s.find('Colour')
+        if colour_el is None:
+            colour_el = ET.SubElement(s, 'Colour')
+        colour_el.text = str(((idx - 1) % 7) + 1)
+
+
 def name_to_index(name: str) -> int:
     """Infer an ordinal index from names like 'One', 'Fourteen', 'TwentyOne', '21'.
     Returns a positive int if recognized, else a large fallback for alpha sort.
@@ -145,11 +155,12 @@ def choose_xml_file():
         selected_xml_path = path
         xml_path_var.set(path)
         add_button.config(state=tk.NORMAL)
+        reassign_button.config(state=tk.NORMAL)
 
 
 def add_printer():
     """Append or update a <Server> in the chosen XML with FileZilla-style formatting.
-    Features: Base64 encoding, duplicate checking, auto-colour cycling, numeric-aware sort, and .bak backup.
+    Features: Base64 encoding, duplicate checking, numeric-aware sort, full-colour reassign (1..7 cycle), and .bak backup.
     """
     global selected_xml_path
 
@@ -166,7 +177,7 @@ def add_printer():
         messagebox.showerror("Missing Data", "Printer Name, IP Address, and Access Code are required.")
         return
 
-    # Determine colour: if provided, validate 1..7; else cycle from last.
+    # Determine colour: if provided, validate 1..7; else temporary cycle from last (will be overwritten by global reassignment).
     cval = None
     if colour_text:
         try:
@@ -238,6 +249,9 @@ def add_printer():
         # Sort servers by numeric-aware name
         ensure_sorted_by_name_numeric(servers_el)
 
+        # Reassign colours 1..7 across the full list to maintain the cycle
+        reassign_colours(servers_el)
+
         # Backup original
         bak_path = selected_xml_path + ".bak"
         try:
@@ -253,7 +267,11 @@ def add_printer():
 
         messagebox.showinfo(
             "Success",
-            f"Printer '{name}' added/updated.\nColour set to {cval}.\nSorted by Name.\nBackup saved as:\n{bak_path}"
+            f"""Printer '{name}' added/updated.
+Colours reassigned globally to maintain 1→7 cycle.
+Sorted by Name.
+Backup saved as:
+{bak_path}"""
         )
 
         # Clear inputs
@@ -262,6 +280,40 @@ def add_printer():
         access_entry.delete(0, tk.END)
         colour_entry.delete(0, tk.END)
 
+    except Exception as e:
+        messagebox.showerror("Error Writing XML", f"{e}")
+
+
+def reassign_only():
+    """Load the chosen XML, sort by numeric-aware name, reassign colours 1..7, and write back (with .bak)."""
+    global selected_xml_path
+
+    if not selected_xml_path:
+        messagebox.showerror("No XML Selected", "Please select the FileZilla XML file first.")
+        return
+    try:
+        tree = ET.parse(selected_xml_path)
+        root = tree.getroot()
+        servers_el = get_servers_root(root)
+
+        ensure_sorted_by_name_numeric(servers_el)
+        reassign_colours(servers_el)
+
+        bak_path = selected_xml_path + ".bak"
+        try:
+            shutil.copy2(selected_xml_path, bak_path)
+        except Exception:
+            pass
+
+        pretty_indent(tree)
+        tree.write(selected_xml_path, encoding='UTF-8', xml_declaration=True)
+
+        messagebox.showinfo(
+            "Colours Reassigned",
+            f"""All printers sorted by Name and Colours reassigned to 1→7 cycle.
+Backup saved as:
+{bak_path}"""
+        )
     except Exception as e:
         messagebox.showerror("Error Writing XML", f"{e}")
 
@@ -295,9 +347,11 @@ ip_entry.grid(row=row + 1, column=1, padx=10, pady=5, sticky="we")
 access_entry.grid(row=row + 2, column=1, padx=10, pady=5, sticky="we")
 colour_entry.grid(row=row + 3, column=1, padx=10, pady=5, sticky="we")
 
-# Add button (disabled until XML file is chosen)
+# Buttons (disabled until XML file is chosen)
 add_button = tk.Button(root, text="Add / Update Printer", command=add_printer, state=tk.DISABLED)
-add_button.grid(row=row + 4, column=0, columnspan=2, pady=12)
+add_button.grid(row=row + 4, column=0, pady=12, sticky="we")
+reassign_button = tk.Button(root, text="Reassign Colours Now", command=reassign_only, state=tk.DISABLED)
+reassign_button.grid(row=row + 4, column=1, pady=12, sticky="we")
 
 # Make column 1 grow
 root.grid_columnconfigure(1, weight=1)
