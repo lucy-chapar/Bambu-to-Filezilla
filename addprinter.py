@@ -3,10 +3,136 @@ from tkinter import messagebox, filedialog
 import base64
 import xml.etree.ElementTree as ET
 import os
+import shutil
 
 # Global to hold the selected XML path
 selected_xml_path = None
 
+# -------- Helpers --------
+ONES = {
+    "ZERO": 0, "ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5,
+    "SIX": 6, "SEVEN": 7, "EIGHT": 8, "NINE": 9,
+    "TEN": 10, "ELEVEN": 11, "TWELVE": 12, "THIRTEEN": 13, "FOURTEEN": 14,
+    "FIFTEEN": 15, "SIXTEEN": 16, "SEVENTEEN": 17, "EIGHTEEN": 18, "NINETEEN": 19
+}
+TENS = {
+    "TWENTY": 20, "THIRTY": 30, "FORTY": 40, "FIFTY": 50,
+    "SIXTY": 60, "SEVENTY": 70, "EIGHTY": 80, "NINETY": 90
+}
+
+
+def name_to_index(name: str) -> int:
+    """Infer an ordinal index from names like 'One', 'Fourteen', 'TwentyOne', '21'.
+    Returns a positive int if recognized, else a large fallback for alpha sort.
+    """
+    if not name:
+        return 10_000
+    s = name.strip().upper().replace(" ", "").replace("-", "")
+    # Direct digits anywhere in the name
+    digits = ''.join(ch for ch in s if ch.isdigit())
+    if digits:
+        try:
+            v = int(digits)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    # Exact 0..19
+    if s in ONES:
+        return ONES[s]
+    # Exact tens
+    if s in TENS:
+        return TENS[s]
+    # Concatenated tens+ones (e.g., TWENTYONE)
+    for t_word, t_val in sorted(TENS.items(), key=lambda kv: -len(kv[0])):
+        if s.startswith(t_word):
+            rem = s[len(t_word):]
+            if not rem:
+                return t_val
+            if rem in ONES:
+                return t_val + ONES[rem]
+    # Fallback for common variants (e.g., ONEHUNDREDTWENTYTHREE -> ignore >99)
+    return 10_000
+
+
+def get_servers_root(tree_root: ET.Element) -> ET.Element:
+    servers = tree_root.find('Servers')
+    if servers is None:
+        servers = ET.SubElement(tree_root, 'Servers')
+    return servers
+
+
+def collect_existing(servers_el: ET.Element):
+    existing = []
+    for srv in list(servers_el):
+        if srv.tag != 'Server':
+            continue
+        name_el = srv.find('Name')
+        host_el = srv.find('Host')
+        colour_el = srv.find('Colour')
+        existing.append({
+            'el': srv,
+            'name': name_el.text.strip() if name_el is not None and name_el.text else '',
+            'host': host_el.text.strip() if host_el is not None and host_el.text else '',
+            'colour': int(colour_el.text) if colour_el is not None and colour_el.text and colour_el.text.isdigit() else None
+        })
+    return existing
+
+
+def next_colour(existing):
+    """Cycle colours 1..7 based on the last server's colour. If none, start at 1."""
+    last_colour = None
+    if existing:
+        # Use the last element order in the file
+        for i in range(len(existing)-1, -1, -1):
+            c = existing[i]['colour']
+            if isinstance(c, int):
+                last_colour = c
+                break
+    if not last_colour:
+        return 1
+    return (last_colour % 7) + 1
+
+
+def pretty_indent(tree: ET.ElementTree):
+    """Indent with tabs to resemble FileZilla output. Uses ET.indent if available; otherwise manual."""
+    if hasattr(ET, 'indent'):
+        ET.indent(tree, space="\t", level=0)
+        return
+
+    def _indent(elem, level=0):
+        i = "\n" + "\t" * level
+        if len(elem):
+            if not elem.text or not elem.text.strip():
+                elem.text = i + "\t"
+            for idx, e in enumerate(list(elem)):
+                _indent(e, level + 1)
+                if not e.tail or not e.tail.strip():
+                    e.tail = i + ("\t" if idx < len(elem) - 1 else "")
+        else:
+            if not elem.text or not elem.text.strip():
+                elem.text = None
+            if level and (not elem.tail or not elem.tail.strip()):
+                elem.tail = i
+    _indent(tree.getroot())
+
+
+def ensure_sorted_by_name_numeric(servers_el: ET.Element):
+    srvs = [s for s in list(servers_el) if s.tag == 'Server']
+    srvs_sorted = sorted(
+        srvs,
+        key=lambda s: (name_to_index((s.find('Name').text if s.find('Name') is not None and s.find('Name').text else '').strip()),
+                       (s.find('Name').text if s.find('Name') is not None and s.find('Name').text else '').lower())
+    )
+    if srvs_sorted != srvs:
+        # Clear and re-append in sorted order
+        for s in srvs:
+            servers_el.remove(s)
+        for s in srvs_sorted:
+            servers_el.append(s)
+
+
+# -------- UI Actions --------
 
 def choose_xml_file():
     """Open a Finder-style dialog to choose the FileZilla XML file."""
@@ -22,7 +148,9 @@ def choose_xml_file():
 
 
 def add_printer():
-    """Append a new <Server> to the chosen XML file with FileZilla-style formatting."""
+    """Append or update a <Server> in the chosen XML with FileZilla-style formatting.
+    Features: Base64 encoding, duplicate checking, auto-colour cycling, numeric-aware sort, and .bak backup.
+    """
     global selected_xml_path
 
     if not selected_xml_path:
@@ -32,22 +160,22 @@ def add_printer():
     name = name_entry.get().strip()
     ip = ip_entry.get().strip()
     access_code = access_entry.get().strip()
-    colour = colour_entry.get().strip()
+    colour_text = colour_entry.get().strip()
 
     if not (name and ip and access_code):
         messagebox.showerror("Missing Data", "Printer Name, IP Address, and Access Code are required.")
         return
 
-    # Validate colour (optional; default to 1 if empty). Must be 1-7
-    if not colour:
-        colour = "1"
-    try:
-        cval = int(colour)
-        if cval < 1 or cval > 7:
-            raise ValueError
-    except ValueError:
-        messagebox.showerror("Invalid Colour", "Colour must be an integer from 1 to 7.")
-        return
+    # Determine colour: if provided, validate 1..7; else cycle from last.
+    cval = None
+    if colour_text:
+        try:
+            cval = int(colour_text)
+            if cval < 1 or cval > 7:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid Colour", "Colour must be an integer from 1 to 7.")
+            return
 
     # Base64 encode the access code
     encoded_pass = base64.b64encode(access_code.encode("utf-8")).decode("utf-8")
@@ -55,43 +183,80 @@ def add_printer():
     try:
         tree = ET.parse(selected_xml_path)
         root = tree.getroot()
+        servers_el = get_servers_root(root)
+        existing = collect_existing(servers_el)
 
-        # Find or create <Servers>
-        servers = root.find('Servers')
-        if servers is None:
-            servers = ET.SubElement(root, 'Servers')
+        # Auto-colour cycle if not provided
+        if cval is None:
+            cval = next_colour(existing)
 
-        # Create <Server> block
-        server = ET.SubElement(servers, 'Server')
-        ET.SubElement(server, 'Host').text = ip
-        ET.SubElement(server, 'Port').text = '990'
-        ET.SubElement(server, 'Protocol').text = '3'
-        ET.SubElement(server, 'Type').text = '0'
-        ET.SubElement(server, 'User').text = 'bblp'
-        ET.SubElement(server, 'Pass', encoding="base64").text = encoded_pass
-        ET.SubElement(server, 'Logontype').text = '1'
-        ET.SubElement(server, 'PasvMode').text = 'MODE_DEFAULT'
-        ET.SubElement(server, 'EncodingType').text = 'Auto'
-        ET.SubElement(server, 'BypassProxy').text = '0'
-        ET.SubElement(server, 'Name').text = name
-        ET.SubElement(server, 'Colour').text = str(cval)
-        ET.SubElement(server, 'SyncBrowsing').text = '0'
-        ET.SubElement(server, 'DirectoryComparison').text = '0'
+        # Duplicate detection by Name or Host
+        dup_by_name = next((e for e in existing if e['name'].lower() == name.lower()), None)
+        dup_by_host = next((e for e in existing if e['host'] == ip), None)
 
-        # Pretty-print with tabs like FileZilla export
-        if hasattr(ET, 'indent'):
-            # Python 3.9+
-            ET.indent(tree, space="\t", level=0)
+        target_el = None
+        if dup_by_name or dup_by_host:
+            # Prefer exact name match if both exist
+            target_el = (dup_by_name or dup_by_host)['el']
+            if not messagebox.askyesno(
+                "Duplicate Found",
+                "An entry with the same Name or Host exists.\n\n"
+                f"Overwrite this existing entry?\n\n"
+                f"Existing Name: {dup_by_name['name'] if dup_by_name else dup_by_host['name']}\n"
+                f"Existing Host: {dup_by_host['host'] if dup_by_host else dup_by_name['host']}"
+            ):
+                return
+        else:
+            target_el = ET.SubElement(servers_el, 'Server')
 
-        # Write back (force XML declaration)
-        tree.write(selected_xml_path, encoding='UTF-8', xml_declaration=True)
+        # Populate/overwrite fields
+        def set_text(tag, value):
+            el = target_el.find(tag)
+            if el is None:
+                el = ET.SubElement(target_el, tag)
+            el.text = value
+
+        set_text('Host', ip)
+        set_text('Port', '990')
+        set_text('Protocol', '3')
+        set_text('Type', '0')
+        set_text('User', 'bblp')
+        pass_el = target_el.find('Pass')
+        if pass_el is None:
+            pass_el = ET.SubElement(target_el, 'Pass')
+        pass_el.set('encoding', 'base64')
+        pass_el.text = encoded_pass
+        set_text('Logontype', '1')
+        set_text('PasvMode', 'MODE_DEFAULT')
+        set_text('EncodingType', 'Auto')
+        set_text('BypassProxy', '0')
+        set_text('Name', name)
+        set_text('Colour', str(cval))
+        set_text('SyncBrowsing', '0')
+        set_text('DirectoryComparison', '0')
+
+        # Sort servers by numeric-aware name
+        ensure_sorted_by_name_numeric(servers_el)
+
+        # Backup original
+        bak_path = selected_xml_path + ".bak"
+        try:
+            shutil.copy2(selected_xml_path, bak_path)
+        except Exception:
+            # Non-fatal
+            pass
+
+        # Pretty-print and write
+        tree_strict = tree  # keep same object
+        pretty_indent(tree_strict)
+        tree_strict.write(selected_xml_path, encoding='UTF-8', xml_declaration=True)
 
         messagebox.showinfo(
             "Success",
-            f"Printer '{name}' added to:\n{selected_xml_path}"
+            f"Printer '{name}' added/updated.\nColour set to {cval}.\nSorted by Name.\nBackup saved as:\n{bak_path}"
         )
 
-        # Clear inputs for next entry
+        # Clear inputs
         name_entry.delete(0, tk.END)
         ip_entry.delete(0, tk.END)
         access_entry.delete(0, tk.END)
@@ -101,7 +266,7 @@ def add_printer():
         messagebox.showerror("Error Writing XML", f"{e}")
 
 
-# GUI Setup
+# -------- GUI --------
 root = tk.Tk()
 root.title("Add Printer to FileZilla XML")
 
@@ -118,7 +283,7 @@ row = 1
 tk.Label(root, text="Printer Name").grid(row=row + 0, column=0, padx=10, pady=5, sticky="e")
 tk.Label(root, text="IP Address").grid(row=row + 1, column=0, padx=10, pady=5, sticky="e")
 tk.Label(root, text="Access Code").grid(row=row + 2, column=0, padx=10, pady=5, sticky="e")
-tk.Label(root, text="Colour (1-7)").grid(row=row + 3, column=0, padx=10, pady=5, sticky="e")
+tk.Label(root, text="Colour (1-7, optional)").grid(row=row + 3, column=0, padx=10, pady=5, sticky="e")
 
 name_entry = tk.Entry(root)
 ip_entry = tk.Entry(root)
@@ -131,7 +296,7 @@ access_entry.grid(row=row + 2, column=1, padx=10, pady=5, sticky="we")
 colour_entry.grid(row=row + 3, column=1, padx=10, pady=5, sticky="we")
 
 # Add button (disabled until XML file is chosen)
-add_button = tk.Button(root, text="Add Printer", command=add_printer, state=tk.DISABLED)
+add_button = tk.Button(root, text="Add / Update Printer", command=add_printer, state=tk.DISABLED)
 add_button.grid(row=row + 4, column=0, columnspan=2, pady=12)
 
 # Make column 1 grow
