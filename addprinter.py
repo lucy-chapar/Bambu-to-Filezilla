@@ -340,6 +340,7 @@ def _tls_reachability(host: str, port: int = 990, timeout: float = 10.0) -> (boo
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
             ctx = ssl.create_default_context()
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # Restrict to secure protocols only
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             with ctx.wrap_socket(sock, server_hostname=host) as ssock:
